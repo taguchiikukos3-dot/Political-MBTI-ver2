@@ -1,0 +1,705 @@
+"""政治MBTI診断 (Streamlit)
+
+- 第1層: 4軸タイプ判定 (経済 / 統治 / 価値観 / 改革)
+- 第2層: 争点プロフィール (タイプ計算には不算入)
+- 1問1画面・タップで自動送り。Streamlit内部のDOMには依存しない
+  (st.button / st.progress / 自前HTMLのみ) ので、PC・スマホで崩れにくい。
+
+動作確認の目安: streamlit >= 1.30
+起動: streamlit run political_mbti_app.py
+"""
+
+import csv
+import io
+import json
+import random
+import tempfile
+from pathlib import Path
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+st.set_page_config(page_title="政治MBTI診断", page_icon="🗳️", layout="centered")
+
+GREEN = "#33a474"
+PURPLE = "#88619a"
+GRAY = "#9ea0a5"
+
+# 自前HTML用の最小限のCSS。Streamlitのダーク/ライトどちらでも読めるよう色は継承。
+st.markdown(
+    f"""
+<style>
+    .q-text {{
+        text-align: center;
+        font-size: 1.3rem;
+        font-weight: 700;
+        line-height: 1.7;
+        margin: 28px 0 24px 0;
+    }}
+    .ab-wrap {{
+        display: flex; flex-direction: column; gap: 10px; margin: 24px 0;
+    }}
+    .ab-box {{
+        border-radius: 12px; padding: 14px 16px; line-height: 1.6;
+        font-weight: 600; border: 2px solid;
+    }}
+    .ab-a {{ border-color: {GREEN}; }}
+    .ab-b {{ border-color: {PURPLE}; }}
+    .ab-tag {{ font-weight: 800; margin-right: 8px; }}
+    .ab-a .ab-tag {{ color: {GREEN}; }}
+    .ab-b .ab-tag {{ color: {PURPLE}; }}
+    .result-type {{
+        font-size: 3.6rem; font-weight: 900; text-align: center;
+        letter-spacing: 0.12em; margin: 4px 0 0 0; color: #FF5722;
+    }}
+    .result-nick {{
+        text-align: center; font-size: 1.2rem; font-weight: 700;
+        margin-bottom: 18px;
+    }}
+    .axis {{ margin: 22px 0 6px 0; }}
+    .axis-name {{ font-weight: 800; margin-bottom: 4px; }}
+    .axis-head {{
+        display: flex; justify-content: space-between;
+        font-size: 0.9rem; font-weight: 700; gap: 8px;
+    }}
+    .bar {{
+        position: relative; display: flex; width: 100%; height: 18px;
+        border-radius: 10px; overflow: hidden; margin-top: 6px;
+        background: #e0e0e0;
+    }}
+    .bar::after {{
+        content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; background: #ffffff;
+    }}
+    .axis-note {{ font-size: 0.85rem; opacity: 0.75; margin-top: 4px; }}
+    .issue-group {{ font-weight: 800; margin: 20px 0 6px 0; }}
+    .issue-row {{
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 8px 0; border-bottom: 1px solid rgba(128,128,128,0.25);
+        gap: 12px;
+    }}
+    .issue-label {{ flex: 1; }}
+    .dots {{ display: flex; gap: 6px; align-items: center; }}
+    .dot {{ width: 14px; height: 14px; border-radius: 50%; display: inline-block; }}
+    .issue-na {{ font-size: 0.85rem; opacity: 0.6; }}
+    .legend {{
+        display: flex; justify-content: space-between;
+        font-size: 0.8rem; opacity: 0.7; margin-top: 4px;
+    }}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# 設問データ
+#   kind: "agree" (賛否) / "ab" (2択)
+#   dir : +1 = 賛成(A)するほど左側の文字(B/L/P/R)に寄る, -1 = 右側(S/A/T/C)に寄る
+#   quick: クイック版(16問)に含めるか
+# ---------------------------------------------------------------------------
+QUESTIONS = [
+    # ---- 経済軸 E : B(国に頼る) ⇔ S(自分で備える) ----
+    {"id": "E1", "axis": "E", "kind": "agree", "dir": 1, "quick": True,
+     "text": "税金が高くなっても、病院代や学費の負担が軽くなるほうがいい"},
+    {"id": "E2", "axis": "E", "kind": "agree", "dir": -1, "quick": True,
+     "text": "税金や保険料が安くなるなら、国がしてくれることが減ってもいい"},
+    {"id": "E3", "axis": "E", "kind": "agree", "dir": 1, "quick": False,
+     "text": "仕事を失ったり病気になったりした人は、国がしっかり支えてほしい"},
+    {"id": "E4", "axis": "E", "kind": "agree", "dir": -1, "quick": False,
+     "text": "頑張った人が、そうでない人よりずっと多く稼げる社会のほうがいい"},
+    {"id": "E5", "axis": "E", "kind": "agree", "dir": 1, "quick": False,
+     "text": "お金持ちや大きな会社は、今よりたくさん税金を払ってもいい"},
+    {"id": "E6", "axis": "E", "kind": "agree", "dir": -1, "quick": False,
+     "text": "国があれこれ口を出すより、会社や個人の自由にやらせたほうが暮らしは良くなる"},
+    {"id": "EA1", "axis": "E", "kind": "ab", "dir": 1, "quick": True,
+     "a": "仕事を失ったら、国がしばらく生活を支えてくれる",
+     "b": "仕事を失っても、まずは自分で何とかする"},
+    {"id": "EA2", "axis": "E", "kind": "ab", "dir": -1, "quick": True,
+     "a": "税金は誰でも同じくらいにして、頑張った分は自分のものにする",
+     "b": "大企業やお金持ちから、多めに税金を取る"},
+    {"id": "EA3", "axis": "E", "kind": "ab", "dir": 1, "quick": False,
+     "a": "老後は、国の年金が中心の暮らし",
+     "b": "老後は、自分の貯金や投資が中心の暮らし"},
+    # ---- 統治軸 G : L(自由) ⇔ A(秩序) ----
+    {"id": "G1", "axis": "G", "kind": "agree", "dir": 1, "quick": True,
+     "text": "多少社会の秩序が乱れても、個人の自由はできるだけ制限されないほうがよい"},
+    {"id": "G2", "axis": "G", "kind": "agree", "dir": -1, "quick": True,
+     "text": "犯罪やテロを防ぐためなら、街中のカメラ増設など、ある程度の監視は受け入れられる"},
+    {"id": "G3", "axis": "G", "kind": "agree", "dir": 1, "quick": True,
+     "text": "政府に批判的な意見でも、自由に発信できる社会が守られるべきだ"},
+    {"id": "G4", "axis": "G", "kind": "agree", "dir": -1, "quick": False,
+     "text": "社会が混乱したときは、強い指導者が物事を決めたほうがうまくいく"},
+    # G5/G6 は「世界観」の暫定設問。試作版データで統治軸に乗るか要検証。
+    {"id": "G5", "axis": "G", "kind": "agree", "dir": -1, "quick": True,
+     "text": "平和を守るには、相手に攻めにくいと思わせるだけの力が必要だ"},
+    {"id": "G6", "axis": "G", "kind": "agree", "dir": 1, "quick": False,
+     "text": "対立している国とも、話し合いと国際ルールを重ねれば、争いは防げる"},
+    # ---- 価値観軸 V : P(多様性) ⇔ T(伝統) ----
+    {"id": "V1", "axis": "V", "kind": "agree", "dir": 1, "quick": True,
+     "text": "子どもには、周りに合わせることより、自分の頭で考えて行動することを教えたい"},
+    {"id": "V2", "axis": "V", "kind": "agree", "dir": -1, "quick": True,
+     "text": "昔から続く慣習や家族のかたちは、変えずに受け継ぐ価値がある"},
+    {"id": "V3", "axis": "V", "kind": "agree", "dir": 1, "quick": True,
+     "text": "身近に、自分と違う文化や生き方の人が増えるのはよいことだ"},
+    {"id": "V4", "axis": "V", "kind": "agree", "dir": -1, "quick": True,
+     "text": "社会のまとまりのためには、価値観や生活習慣がある程度そろっていたほうがよい"},
+    {"id": "V5", "axis": "V", "kind": "agree", "dir": 1, "quick": False,
+     "text": "結婚や家族のあり方は、人それぞれが自由に選べばよい"},
+    {"id": "V6", "axis": "V", "kind": "agree", "dir": -1, "quick": False,
+     "text": "家庭や職場で、男女に期待される役割が多少違うのは自然なことだ"},
+    # ---- 改革軸 R : R(改革) ⇔ C(安定) ----
+    {"id": "R1", "axis": "R", "kind": "agree", "dir": 1, "quick": True,
+     "text": "うまくいっていない制度は、混乱があっても思い切って作り直すべきだ"},
+    {"id": "R2", "axis": "R", "kind": "agree", "dir": -1, "quick": True,
+     "text": "制度は少しずつ手直ししていくほうが、失敗が少なくてよい"},
+    {"id": "R3", "axis": "R", "kind": "agree", "dir": 1, "quick": True,
+     "text": "前例や慣習にしばられない新しい人や政党に、政治を任せてみたい"},
+    {"id": "R4", "axis": "R", "kind": "agree", "dir": -1, "quick": True,
+     "text": "長く続いてきた仕組みにはそれなりの理由があるので、まず尊重すべきだ"},
+    {"id": "R5", "axis": "R", "kind": "agree", "dir": 1, "quick": False,
+     "text": "今の日本は、大きな変化が必要な段階にある"},
+    {"id": "R6", "axis": "R", "kind": "agree", "dir": -1, "quick": False,
+     "text": "変化を急ぐより、今の暮らしの安定を守ることを優先したい"},
+]
+
+# 第2層: 争点プロフィール (タイプ計算には使わない)
+ISSUES = [
+    ("I1", "安保・外交", "防衛力の強化"),
+    ("I2", "安保・外交", "憲法9条の改正"),
+    ("I3", "エネルギー", "原子力発電の活用（再稼働・新設）"),
+    ("I4", "社会", "同性婚の法制化"),
+    ("I5", "社会", "選択的夫婦別姓の導入"),
+    ("I6", "社会", "外国人労働者の受け入れ拡大"),
+    ("I7", "経済", "消費税の減税"),
+    ("I8", "経済", "国債を発行しての景気対策（財政出動）"),
+    ("I9", "経済", "最低賃金の大幅な引き上げ"),
+    ("I10", "統治・制度", "憲法への緊急事態条項の新設"),
+    ("I11", "統治・制度", "SNS上の誹謗中傷への規制強化"),
+    ("I12", "統治・制度", "国会議員の定数削減"),
+]
+for _id, _group, _label in ISSUES:
+    QUESTIONS.append(
+        {"id": _id, "axis": None, "kind": "issue", "dir": 0, "quick": False,
+         "group": _group, "label": _label, "text": f"{_label}に賛成ですか？"}
+    )
+
+QMAP = {q["id"]: q for q in QUESTIONS}
+QUICK_IDS = [q["id"] for q in QUESTIONS if q["axis"] and q["quick"]]
+MORE_IDS = [q["id"] for q in QUESTIONS if q["axis"] and not q["quick"]]
+ISSUE_IDS = [q["id"] for q in QUESTIONS if q["kind"] == "issue"]
+
+# 軸の定義 (表示順 = タイプ文字の並び順)
+AXES = {
+    "E": {"name": "経済", "left": ("B", "国に頼る", "大きな政府・再分配"),
+          "right": ("S", "自分で備える", "小さな政府・市場")},
+    "G": {"name": "統治", "left": ("L", "自由", "個人・権利を重視"),
+          "right": ("A", "秩序", "治安・まとまりを重視")},
+    "V": {"name": "価値観", "left": ("P", "多様性", "個人の選択・新しい価値観"),
+          "right": ("T", "伝統", "慣習・既存の規範")},
+    "R": {"name": "改革姿勢", "left": ("R", "改革", "現状を大きく変える"),
+          "right": ("C", "安定", "少しずつ・今を守る")},
+}
+
+# タイプのニックネーム (仮)。評価的に聞こえない表現に調整してください。
+NICKNAMES = {
+    "BLPR": "理想を掲げる改革派", "BLPC": "寄り添うリベラル派",
+    "BLTR": "人情派の改革者", "BLTC": "暮らしを守る堅実派",
+    "BAPR": "制度で変える設計派", "BAPC": "制度で支える安定派",
+    "BATR": "強い国を立て直す再建派", "BATC": "守りの福祉国家派",
+    "SLPR": "自由な挑戦者", "SLPC": "マイペース個人主義者",
+    "SLTR": "自立の改革派", "SLTC": "自己責任の堅実派",
+    "SAPR": "効率重視の改革者", "SAPC": "現実主義の管理者",
+    "SATR": "市場と強い国の変革派", "SATC": "秩序と自立の守り手",
+}
+
+AGREE_OPTIONS = [
+    ("🟢 賛成", 2),
+    ("🌿 どちらかといえば賛成", 1),
+    ("⚪ どちらともいえない", 0),
+    ("🪻 どちらかといえば反対", -1),
+    ("🟣 反対", -2),
+]
+AB_OPTIONS = [
+    ("🟢 Aに近い", 2),
+    ("🌿 ややA", 1),
+    ("⚪ どちらでもない", 0),
+    ("🪻 ややB", -1),
+    ("🟣 Bに近い", -2),
+]
+
+
+
+
+# ---------------------------------------------------------------------------
+# 参考データ: 2026年衆院選 東京大学谷口研究室・朝日新聞社 共同政治家調査から算出
+#   (build_positions.py で生成 / 経済E・統治G・価値観Vのみ。改革軸Rは対応する設問がなく算出不可)
+#   各軸 -1〜+1、+ は B/L/P 側。診断の設問と調査の設問は文面が違うため、あくまで参考値。
+# ---------------------------------------------------------------------------
+POSITIONS = json.loads(r'''{"source": "2026年東京大学谷口研究室・朝日新聞社共同政治家調査(2026衆院選, 有効回答1197人)", "parties": {"自民党": {"n": 303, "E": {"mean": 0.156, "q25": 0.0, "q75": 0.3, "n": 300}, "G": {"mean": -0.427, "q25": -0.583, "q75": -0.25, "n": 300}, "V": {"mean": -0.269, "q25": -0.5, "q75": -0.083, "n": 300}, "types": {"BAT": 192, "BAP": 44, "SAT": 37, "SAP": 11, "BLP": 10, "BLT": 3, "SLT": 1, "SLP": 1}}, "中道改革連合": {"n": 233, "E": {"mean": 0.403, "q25": 0.2, "q75": 0.6, "n": 232}, "G": {"mean": 0.303, "q25": 0.083, "q75": 0.5, "n": 233}, "V": {"mean": 0.587, "q25": 0.417, "q75": 0.75, "n": 233}, "types": {"BLP": 209, "BAP": 18, "BLT": 3, "BAT": 1, "SLP": 1}}, "日本維新の会": {"n": 87, "E": {"mean": -0.228, "q25": -0.3, "q75": -0.1, "n": 87}, "G": {"mean": -0.459, "q25": -0.5, "q75": -0.375, "n": 87}, "V": {"mean": -0.099, "q25": -0.208, "q75": 0.083, "n": 87}, "types": {"SAP": 49, "SAT": 27, "BAT": 7, "BAP": 3, "BLT": 1}}, "国民民主党": {"n": 102, "E": {"mean": 0.088, "q25": -0.1, "q75": 0.3, "n": 102}, "G": {"mean": -0.239, "q25": -0.417, "q75": -0.083, "n": 102}, "V": {"mean": 0.146, "q25": -0.083, "q75": 0.333, "n": 102}, "types": {"BAP": 33, "BAT": 23, "SAP": 22, "BLP": 15, "SAT": 5, "SLP": 3, "BLT": 1}}, "れいわ新選組": {"n": 31, "E": {"mean": 0.794, "q25": 0.8, "q75": 0.8, "n": 31}, "G": {"mean": 0.984, "q25": 1.0, "q75": 1.0, "n": 31}, "V": {"mean": 0.659, "q25": 0.667, "q75": 0.667, "n": 31}, "types": {"BLP": 31}}, "共産党": {"n": 176, "E": {"mean": 0.802, "q25": 0.8, "q75": 0.9, "n": 176}, "G": {"mean": 0.928, "q25": 0.917, "q75": 0.917, "n": 176}, "V": {"mean": 0.803, "q25": 0.75, "q75": 0.833, "n": 176}, "types": {"BLP": 176}}, "参政党": {"n": 161, "E": {"mean": 0.393, "q25": 0.4, "q75": 0.4, "n": 161}, "G": {"mean": -0.556, "q25": -0.583, "q75": -0.583, "n": 161}, "V": {"mean": -0.841, "q25": -0.833, "q75": -0.833, "n": 161}, "types": {"BAT": 160, "SAT": 1}}, "日本保守党": {"n": 16, "E": {"mean": 0.069, "q25": -0.025, "q75": 0.1, "n": 16}, "G": {"mean": -0.719, "q25": -0.833, "q75": -0.646, "n": 16}, "V": {"mean": -0.906, "q25": -1.0, "q75": -0.833, "n": 16}, "types": {"BAT": 12, "SAT": 4}}, "社民党": {"n": 14, "E": {"mean": 0.75, "q25": 0.625, "q75": 0.8, "n": 14}, "G": {"mean": 0.911, "q25": 0.854, "q75": 1.0, "n": 14}, "V": {"mean": 0.899, "q25": 0.854, "q75": 1.0, "n": 14}, "types": {"BLP": 14}}, "チームみらい": {"n": 14, "E": {"mean": -0.093, "q25": -0.25, "q75": 0.075, "n": 14}, "G": {"mean": 0.046, "q25": -0.083, "q75": 0.146, "n": 14}, "V": {"mean": 0.226, "q25": 0.167, "q75": 0.396, "n": 14}, "types": {"SLP": 5, "SAP": 3, "BLP": 2, "BAP": 2, "BLT": 1, "BAT": 1}}, "減税日本・ゆうこく連合": {"n": 15, "E": {"mean": 0.46, "q25": 0.1, "q75": 0.7, "n": 15}, "G": {"mean": -0.323, "q25": -0.542, "q75": -0.167, "n": 15}, "V": {"mean": -0.283, "q25": -0.5, "q75": -0.167, "n": 15}, "types": {"BAT": 10, "BAP": 2, "BLP": 1, "BLT": 1, "SAT": 1}}}, "type_party": {"BAP": {"チームみらい": 2, "中道改革連合": 18, "国民民主党": 33, "日本維新の会": 3, "減税日本・ゆうこく連合": 2, "自民党": 44}, "BAT": {"チームみらい": 1, "中道改革連合": 1, "参政党": 160, "国民民主党": 23, "日本保守党": 12, "日本維新の会": 7, "減税日本・ゆうこく連合": 10, "自民党": 192}, "BLP": {"れいわ新選組": 31, "チームみらい": 2, "中道改革連合": 209, "共産党": 176, "国民民主党": 15, "減税日本・ゆうこく連合": 1, "社民党": 14, "自民党": 10}, "BLT": {"チームみらい": 1, "中道改革連合": 3, "国民民主党": 1, "日本維新の会": 1, "減税日本・ゆうこく連合": 1, "自民党": 3}, "SAP": {"チームみらい": 3, "国民民主党": 22, "日本維新の会": 49, "自民党": 11}, "SAT": {"参政党": 1, "国民民主党": 5, "日本保守党": 4, "日本維新の会": 27, "減税日本・ゆうこく連合": 1, "自民党": 37}, "SLP": {"チームみらい": 5, "中道改革連合": 1, "国民民主党": 3, "自民党": 1}, "SLT": {"自民党": 1}}, "leaders": {"高市早苗": {"party": "自民党", "status": "調査に回答なし/該当行なし", "rows": 0}, "野田佳彦": {"party": "中道改革連合", "E": 0.6, "G": 0.167, "V": 0.833, "type3": "BLP"}, "斉藤鉄夫": {"party": "中道改革連合", "E": 0.2, "G": 0.083, "V": 0.667, "type3": "BLP"}, "吉村洋文": {"party": "日本維新の会", "status": "調査に回答なし/該当行なし", "rows": 0}, "玉木雄一郎": {"party": "国民民主党", "E": 0.2, "G": -0.333, "V": 0.083, "type3": "BAP"}, "山本太郎": {"party": "れいわ新選組", "status": "調査に回答なし/該当行なし", "rows": 0}, "田村智子": {"party": "共産党", "E": 0.8, "G": 0.917, "V": 0.75, "type3": "BLP"}, "神谷宗幣": {"party": "参政党", "status": "調査に回答なし/該当行なし", "rows": 0}}}''')
+AX_JP = {"E": "経済", "G": "統治", "V": "価値観"}
+
+# ---------------------------------------------------------------------------
+# 横一列の丸ボタン (カスタムコンポーネント)
+#   Streamlitのボタンはスマホ幅で縦積みになるため、丸の列だけ自前のHTML/JSで描画する。
+#   ビルド不要: 起動時にindex.htmlを一時フォルダへ書き出して読み込む。
+# ---------------------------------------------------------------------------
+RING_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent;
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  #root { max-width: 480px; margin: 0 auto; padding: 4px 6px 6px; box-sizing: border-box; }
+  .ends { display: flex; justify-content: space-between; font-weight: 800;
+    font-size: 15px; margin-bottom: 10px; }
+  .row { display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 12px; border-bottom: 1px solid rgba(128,128,128,.3); }
+  .cell { width: 50px; display: flex; justify-content: center; align-items: center; }
+  .opt { -webkit-appearance: none; appearance: none; background: transparent;
+    border-style: solid; border-radius: 50%; padding: 0; margin: 0; cursor: pointer;
+    transition: background .15s, transform .15s; }
+  .opt:hover { background: var(--tint); transform: scale(1.08); }
+  .opt:focus-visible { outline: 3px solid rgba(255,87,34,.7); outline-offset: 3px; }
+  .opt.on { background: var(--c); }
+</style></head>
+<body><div id="root"></div>
+<script>
+  var SIZES = [46, 34, 22, 34, 46];
+  var BORDERS = [3, 3, 2, 3, 3];
+  var VALUES = [2, 1, 0, -1, -2];
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data), "*");
+  }
+  function tint(hex) {
+    var n = parseInt(hex.slice(1), 16);
+    return "rgba(" + (n >> 16) + "," + ((n >> 8) & 255) + "," + (n & 255) + ",.25)";
+  }
+  function render(args, theme) {
+    var root = document.getElementById("root");
+    var colors = [args.green, args.green, args.gray, args.purple, args.purple];
+    if (theme && theme.textColor) { document.body.style.color = theme.textColor; }
+    var html = '<div class="ends"><span style="color:' + args.green + '">' + args.left +
+      '</span><span style="color:' + args.purple + '">' + args.right + '</span></div>' +
+      '<div class="row">';
+    for (var i = 0; i < 5; i++) {
+      html += '<div class="cell"><button class="opt' + (args.selected === VALUES[i] ? ' on' : '') +
+        '" data-v="' + VALUES[i] + '" aria-label="' + args.labels[i] + '" title="' + args.labels[i] +
+        '" style="width:' + SIZES[i] + 'px;height:' + SIZES[i] + 'px;border-width:' + BORDERS[i] +
+        'px;border-color:' + colors[i] + ';--c:' + colors[i] + ';--tint:' + tint(colors[i]) +
+        '"></button></div>';
+    }
+    html += '</div>';
+    root.innerHTML = html;
+    var btns = root.querySelectorAll(".opt");
+    for (var j = 0; j < btns.length; j++) {
+      btns[j].addEventListener("click", function (e) {
+        var b = e.currentTarget;
+        var all = root.querySelectorAll(".opt");
+        for (var k = 0; k < all.length; k++) { all[k].classList.remove("on"); }
+        b.classList.add("on");
+        send("streamlit:setComponentValue", {value: parseInt(b.getAttribute("data-v"), 10), dataType: "json"});
+      });
+    }
+    send("streamlit:setFrameHeight", {height: document.documentElement.scrollHeight});
+  }
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") { render(e.data.args, e.data.theme); }
+  });
+  send("streamlit:componentReady", {apiVersion: 1});
+</script></body></html>
+"""
+
+
+def _declare_ring():
+    d = Path(tempfile.gettempdir()) / "political_mbti_ring"
+    d.mkdir(exist_ok=True)
+    f = d / "index.html"
+    if not f.exists() or f.read_text(encoding="utf-8") != RING_HTML:
+        f.write_text(RING_HTML, encoding="utf-8")
+    return components.declare_component("political_mbti_ring", path=str(d))
+
+
+_ring = _declare_ring()
+
+
+def ring_select(qid, left, right, labels, selected):
+    """丸5つを横一列で表示し、押された値(2..-2)を返す。未選択ならNone。"""
+    ss = st.session_state
+    return _ring(
+        left=left, right=right, labels=labels, selected=selected,
+        green=GREEN, purple=PURPLE, gray=GRAY,
+        key=f"ring_{ss.nonce}_{qid}", default=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 状態管理
+# ---------------------------------------------------------------------------
+def init_state():
+    ss = st.session_state
+    if "page" not in ss:
+        ss.page = "intro"      # intro / quiz / result
+        ss.answers = {}        # id -> -2..2 / None(わからない)
+        ss.queue = []
+        ss.pos = 0
+        ss.stage = "base"      # base / more / issues
+        ss.seed = random.randrange(10**9)
+        ss.nonce = 0           # 質問が切り替わるたびに+1 (コンポーネントの値をリセット)
+
+
+def start_quiz(stage, ids):
+    ss = st.session_state
+    rng = random.Random(f"{ss.seed}-{stage}")
+    shuffled = list(ids)
+    rng.shuffle(shuffled)
+    ss.queue = [i for i in shuffled if i not in ss.answers]
+    ss.pos = 0
+    ss.stage = stage
+    ss.page = "quiz" if ss.queue else "result"
+
+
+def answer(qid, val):
+    ss = st.session_state
+    ss.answers[qid] = val
+    ss.pos += 1
+    ss.nonce += 1
+    if ss.pos >= len(ss.queue):
+        ss.page = "result"
+
+
+def go_back():
+    ss = st.session_state
+    if ss.pos > 0:
+        ss.pos -= 1
+        ss.nonce += 1
+
+
+def show_result():
+    st.session_state.page = "result"
+
+
+def reset_all():
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+
+
+# ---------------------------------------------------------------------------
+# 計算
+# ---------------------------------------------------------------------------
+def axis_score(axis):
+    """-1(右側) 〜 +1(左側) の比率と、有効回答数を返す。回答3問未満はNone。"""
+    ans = st.session_state.answers
+    total, n = 0, 0
+    for q in QUESTIONS:
+        if q["axis"] != axis:
+            continue
+        v = ans.get(q["id"])
+        if v is None:
+            continue
+        total += v * q["dir"]
+        n += 1
+    if n < 3:
+        return None, n
+    return total / (2 * n), n
+
+
+def strength_label(ratio, left, right):
+    a = abs(ratio)
+    side = left if ratio >= 0 else right
+    if a < 0.15:
+        return "ほぼ中央（バランス型）"
+    if a < 0.5:
+        return f"やや {side[0]}（{side[1]}）寄り"
+    return f"{side[0]}（{side[1]}）寄り"
+
+
+# ---------------------------------------------------------------------------
+# 画面
+# ---------------------------------------------------------------------------
+def render_intro():
+    st.title("🗳️ 政治MBTI診断")
+    st.write(
+        "政党名ではなく、暮らしや社会についての「考え方」から、"
+        "あなたの政治的な傾向を4つの軸でタイプにします。"
+        "正解はありません。直感で答えてください。"
+    )
+    st.caption("※ 娯楽・自己理解のための診断です。投票先を推薦するものではありません。")
+    st.write("")
+    st.button(
+        "⚡ クイック診断（16問・約3分）",
+        on_click=start_quiz, args=("base", QUICK_IDS),
+        use_container_width=True, type="primary",
+    )
+    st.button(
+        "🔍 じっくり診断（27問・約6分）",
+        on_click=start_quiz, args=("base", QUICK_IDS + MORE_IDS),
+        use_container_width=True,
+    )
+
+
+def render_quiz():
+    ss = st.session_state
+    q = QMAP[ss.queue[ss.pos]]
+    total = len(ss.queue)
+
+    if ss.stage != "base":
+        st.button("← 結果に戻る", on_click=show_result, key="to_result")
+
+    st.progress(ss.pos / total, text=f"{ss.pos + 1} / {total}")
+
+    if q["kind"] == "ab":
+        st.markdown(
+            f"""
+<div class="ab-wrap">
+  <div class="ab-box ab-a"><span class="ab-tag">A</span>{q["a"]}</div>
+  <div class="ab-box ab-b"><span class="ab-tag">B</span>{q["b"]}</div>
+</div>
+<div class="q-text" style="font-size:1.05rem;margin-top:0;">どちらに近いですか？</div>
+""",
+            unsafe_allow_html=True,
+        )
+        options, ends = AB_OPTIONS, ("A", "B")
+    else:
+        st.markdown(f'<div class="q-text">{q["text"]}</div>', unsafe_allow_html=True)
+        options, ends = AGREE_OPTIONS, ("賛成", "反対")
+
+    picked = ring_select(
+        q["id"], ends[0], ends[1],
+        [label.split(" ", 1)[1] for label, _ in options],
+        ss.answers.get(q["id"]),
+    )
+    st.caption("丸をタップして回答します。")
+    st.button(
+        "わからない / 答えたくない", key=f'{q["id"]}_na', on_click=answer,
+        args=(q["id"], None), use_container_width=True,
+    )
+    if picked is not None:
+        answer(q["id"], picked)
+        st.rerun()
+    if ss.pos > 0:
+        st.button("← ひとつ前に戻る", key=f'{q["id"]}_back', on_click=go_back)
+
+
+def axis_bar_html(axis_key, ratio, n):
+    info = AXES[axis_key]
+    left, right = info["left"], info["right"]
+    pct_left = (ratio + 1) / 2 * 100
+    return f"""
+<div class="axis">
+  <div class="axis-name">{info["name"]}</div>
+  <div class="axis-head">
+    <span style="color:{GREEN};">{left[0]}　{left[1]}</span>
+    <span style="color:{PURPLE};">{right[1]}　{right[0]}</span>
+  </div>
+  <div class="bar">
+    <div style="width:{pct_left:.1f}%;background:{GREEN};"></div>
+    <div style="width:{100 - pct_left:.1f}%;background:{PURPLE};"></div>
+  </div>
+  <div class="axis-note">{strength_label(ratio, left, right)}（{n}問に回答）</div>
+</div>
+"""
+
+
+def issue_dots_html(val):
+    colors = {2: GREEN, 1: "#8fd3b4", 0: "#c9cacd", -1: "#c5aad2", -2: PURPLE}
+    dots = ""
+    for v in (2, 1, 0, -1, -2):
+        selected = v == val
+        dots += (
+            f'<span class="dot" style="background:{colors[v]};'
+            f'opacity:{1 if selected else 0.18};'
+            f'transform:scale({1.3 if selected else 0.85});"></span>'
+        )
+    return f'<div class="dots">{dots}</div>'
+
+
+def render_issue_profile():
+    ans = st.session_state.answers
+    st.markdown("### 🧭 争点プロフィール")
+    st.caption(
+        "タイプとは別に、個別の争点での立ち位置を表示します。"
+        "タイプと違う位置があっても自然なことです。"
+    )
+    st.markdown(
+        '<div class="legend"><span>賛成</span><span>反対</span></div>',
+        unsafe_allow_html=True,
+    )
+    groups = []
+    for _, g, _ in ISSUES:
+        if g not in groups:
+            groups.append(g)
+    html = ""
+    for g in groups:
+        html += f'<div class="issue-group">{g}</div>'
+        for iid, grp, label in ISSUES:
+            if grp != g:
+                continue
+            val = ans.get(iid)
+            right = '<span class="issue-na">わからない</span>' if val is None \
+                else issue_dots_html(val)
+            html += (
+                f'<div class="issue-row"><span class="issue-label">{label}</span>'
+                f"{right}</div>"
+            )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def answers_csv():
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "axis", "dir", "value"])
+    for qid, val in st.session_state.answers.items():
+        q = QMAP[qid]
+        w.writerow([qid, q["axis"] or "issue", q["dir"], "" if val is None else val])
+    return buf.getvalue()
+
+
+
+def compare_mark(u, p):
+    """診断の得点uと政党・政治家の位置pを比べる。◎ほぼ一致 / ○同じ側 / ×反対側"""
+    if abs(u - p) < 0.35:
+        return "◎"
+    if u * p > 0 or abs(u) < 0.15 or abs(p) < 0.15:
+        return "○"
+    return "×"
+
+
+def _dist(u, pos):
+    return (sum((u[a] - pos[a]) ** 2 for a in u) / len(u)) ** 0.5
+
+
+def render_reference(rows):
+    """結果画面の「近い政党・政治家(参考)」。E/G/Vのみで比較(R軸は調査に設問がない)。"""
+    u = {k: r for k, r, _ in rows if k in AX_JP and r is not None}
+    if len(u) < 2:
+        return
+    st.markdown("### 🏛️ 近い政党・政治家（参考）")
+    st.caption(
+        "2026年衆院選の候補者調査（東大谷口研・朝日新聞）の回答から計算。"
+        "◎ほぼ一致　○同じ側　×反対側。診断の設問とは文面が違うため、おおまかな目安です。"
+        "改革軸（R/C）は調査に対応する設問がないため比べていません。"
+    )
+
+    def marks(getpos):
+        return "　".join(f"{AX_JP[a]}{compare_mark(u[a], getpos(a))}" for a in AX_JP if a in u)
+
+    # 政党
+    ranked = sorted(
+        POSITIONS["parties"].items(),
+        key=lambda kv: _dist(u, {a: kv[1][a]["mean"] for a in u}),
+    )
+    medals = ["🥇", "🥈", "🥉"]
+    html = ""
+    for i, (name, rec) in enumerate(ranked):
+        top = sorted(rec["types"].items(), key=lambda x: -x[1])
+        typ = f"最多は{top[0][0]}型（{top[0][1] / sum(rec['types'].values()):.0%}）" if top else ""
+        mark = medals[i] if i < 3 else f"{i + 1}."
+        html += (
+            f'<div class="issue-row"><span class="issue-label">{mark} <b>{name}</b>'
+            f'<span class="issue-na">　n={rec["n"]}　{typ}</span></span>'
+            f'<span>{marks(lambda a, rec=rec: rec[a]["mean"])}</span></div>'
+        )
+    st.markdown(html, unsafe_allow_html=True)
+
+    # 党首(調査に回答した人のみ)
+    leaders = {k: v for k, v in POSITIONS["leaders"].items() if "status" not in v}
+    if leaders:
+        st.markdown("**党首（調査に回答した人のみ）**")
+        lr = sorted(leaders.items(), key=lambda kv: _dist(u, {a: kv[1][a] for a in u}))
+        html = ""
+        for name, v in lr:
+            html += (
+                f'<div class="issue-row"><span class="issue-label"><b>{name}</b>'
+                f'<span class="issue-na">　{v["party"]}　{v["type3"]}型</span></span>'
+                f'<span>{marks(lambda a, v=v: v[a])}</span></div>'
+            )
+        st.markdown(html, unsafe_allow_html=True)
+        missing = [k for k, v in POSITIONS["leaders"].items() if "status" in v]
+        if missing:
+            st.caption("調査データに回答がない・候補者でないため載せていない人: " + "、".join(missing))
+
+    # 同じ骨格タイプの候補者
+    if len(u) == 3:
+        my3 = "".join(
+            (AXES[a]["left"][0] if u[a] >= 0 else AXES[a]["right"][0]) for a in ("E", "G", "V")
+        )
+        tp = POSITIONS["type_party"].get(my3, {})
+        total = sum(tp.values())
+        st.markdown(f"**あなたと同じ骨格タイプ（{my3}）の候補者**")
+        if total == 0:
+            st.write("今回の候補者には、同じタイプの人が見当たりません。")
+        else:
+            items = sorted(tp.items(), key=lambda x: -x[1])
+            st.write(f"全国で{total}人。" + "　".join(f"{p} {n}人" for p, n in items[:6]))
+
+
+def render_result():
+    ss = st.session_state
+    st.markdown("## 📊 あなたの診断結果")
+
+    letters, rows = "", []
+    for key, info in AXES.items():
+        ratio, n = axis_score(key)
+        if ratio is None:
+            letters += "?"
+            rows.append((key, None, n))
+        else:
+            side = info["left"] if ratio >= 0 else info["right"]
+            letters += side[0]
+            rows.append((key, ratio, n))
+
+    st.markdown(f'<div class="result-type">{letters}</div>', unsafe_allow_html=True)
+    nick = NICKNAMES.get(letters)
+    if nick:
+        st.markdown(f'<div class="result-nick">{nick}</div>', unsafe_allow_html=True)
+
+    for key, ratio, n in rows:
+        if ratio is None:
+            st.markdown(
+                f'<div class="axis"><div class="axis-name">{AXES[key]["name"]}</div>'
+                f'<div class="axis-note">回答が足りないため判定保留です（{n}問）。</div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(axis_bar_html(key, ratio, n), unsafe_allow_html=True)
+
+    render_reference(rows)
+
+    st.write("")
+    more_left = [i for i in MORE_IDS if i not in ss.answers]
+    issues_left = [i for i in ISSUE_IDS if i not in ss.answers]
+
+    if more_left:
+        st.button(
+            f"🎯 精度アップ（あと{len(more_left)}問）",
+            on_click=start_quiz, args=("more", MORE_IDS),
+            use_container_width=True,
+        )
+
+    if issues_left:
+        st.button(
+            f"🧭 争点プロフィールを見る（{len(issues_left)}問）",
+            on_click=start_quiz, args=("issues", ISSUE_IDS),
+            use_container_width=True, type="primary",
+        )
+    else:
+        render_issue_profile()
+
+    st.write("")
+    with st.expander("回答データをCSVで保存（試作版の検証用）"):
+        st.download_button(
+            "CSVをダウンロード", data=answers_csv(),
+            file_name="political_mbti_answers.csv", mime="text/csv",
+        )
+    st.button("🔄 最初からやり直す", on_click=reset_all, use_container_width=True)
+    st.caption("※ 娯楽・自己理解のための診断です。投票先を推薦するものではありません。")
+
+
+# ---------------------------------------------------------------------------
+init_state()
+page = st.session_state.page
+if page == "intro":
+    render_intro()
+elif page == "quiz":
+    render_quiz()
+else:
+    render_result()
